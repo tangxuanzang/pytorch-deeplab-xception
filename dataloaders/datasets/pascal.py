@@ -107,6 +107,7 @@ class VOCSegmentation(Dataset):
 if __name__ == '__main__':
     from dataloaders.utils import decode_segmap
     from torch.utils.data import DataLoader
+    from tqdm import tqdm
     import matplotlib.pyplot as plt
     import argparse
 
@@ -119,7 +120,7 @@ if __name__ == '__main__':
 
     dataloader = DataLoader(voc_train, batch_size=5, shuffle=True, num_workers=0)
 
-    for ii, sample in enumerate(dataloader):
+    for ii, sample in tqdm(enumerate(dataloader)):
         for jj in range(sample["image"].size()[0]):
             img = sample['image'].numpy()
             gt = sample['label'].numpy()
@@ -138,7 +139,8 @@ if __name__ == '__main__':
             plt.imshow(segmap)
 
         if ii == 1:
-            break
+            # break
+            continue
 
     plt.show(block=True)
 
