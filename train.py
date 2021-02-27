@@ -1,10 +1,16 @@
 import argparse
+import hashlib
 import os
+import time
+
 import numpy as np
 from tqdm import tqdm
+from PIL import Image
+from torchvision import transforms
+from tensorboardX import SummaryWriter
 
-from mypath import Path
 from dataloaders import make_data_loader
+from dataloaders.utils import decode_segmap, decode_seg_map_sequence
 from modeling.sync_batchnorm.replicate import patch_replication_callback
 from modeling.deeplab import *
 from utils.loss import SegmentationLosses
@@ -19,21 +25,22 @@ class Trainer(object):
         self.args = args
 
         # Define Saver
-        self.saver = Saver(args)
-        self.saver.save_experiment_config()
+        self.saver = Saver(args.resume, args.ft)
+        if not args.resume or args.ft:
+            self.saver.save_experiment_config(args)
         # Define Tensorboard Summary
-        self.summary = TensorboardSummary(self.saver.experiment_dir)
-        self.writer = self.summary.create_summary()
-        
+        self.summary = TensorboardSummary(self.saver.expr_dir)
+        self.summary_writer = SummaryWriter(self.saver.expr_dir)
         # Define Dataloader
-        kwargs = {'num_workers': args.workers, 'pin_memory': True}
-        self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
+        kwargs = {'num_workers': args.workers, 'pin_memory': False}
+        self.train_loader, self.val_loader, _, self.num_classes = make_data_loader(args, **kwargs)
 
         # Define network
-        model = DeepLab(num_classes=self.nclass,
-                        backbone=args.backbone,
+        model = DeepLab(backbone=args.backbone,
+                        in_channels=args.in_channels,
                         output_stride=args.out_stride,
-                        sync_bn=args.sync_bn,
+                        num_classes=self.num_classes,
+                        sync_bn=args.sync_bn, 
                         freeze_bn=args.freeze_bn)
 
         train_params = [{'params': model.get_1x_lr_params(), 'lr': args.lr},
@@ -56,9 +63,6 @@ class Trainer(object):
             weight = None
         self.criterion = SegmentationLosses(weight=weight, cuda=args.cuda).build_loss(mode=args.loss_type)
         self.model, self.optimizer = model, optimizer
-        
-        # Define Evaluator
-        self.evaluator = Evaluator(self.nclass)
         # Define lr scheduler
         self.scheduler = LR_Scheduler(args.lr_scheduler, args.lr,
                                             args.epochs, len(self.train_loader))
@@ -70,31 +74,29 @@ class Trainer(object):
             self.model = self.model.cuda()
 
         # Resuming checkpoint
-        self.best_pred = 0.0
-        if args.resume is not None:
+        self.best_pred = self.saver.get_previous_best()
+        if args.resume:
             if not os.path.isfile(args.resume):
-                raise RuntimeError("=> no checkpoint found at '{}'" .format(args.resume))
+                raise RuntimeError("no checkpoint found at '{}'" .format(args.resume))
             checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint['epoch']
+            args.start_epoch = checkpoint['epoch'] if not args.ft else 0
             if args.cuda:
                 self.model.module.load_state_dict(checkpoint['state_dict'])
             else:
                 self.model.load_state_dict(checkpoint['state_dict'])
             if not args.ft:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
-            self.best_pred = checkpoint['best_pred']
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+            print("loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
 
-        # Clear start epoch if fine-tuning
-        if args.ft:
-            args.start_epoch = 0
 
+        # Define Evaluator
+        self.evaluator = Evaluator(self.num_classes)
+    
     def training(self, epoch):
         train_loss = 0.0
         self.model.train()
         tbar = tqdm(self.train_loader)
-        num_img_tr = len(self.train_loader)
+        iters_per_epoch = len(self.train_loader)
         for i, sample in enumerate(tbar):
             image, target = sample['image'], sample['label']
             if self.args.cuda:
@@ -107,27 +109,25 @@ class Trainer(object):
             self.optimizer.step()
             train_loss += loss.item()
             tbar.set_description('Train loss: %.3f' % (train_loss / (i + 1)))
-            self.writer.add_scalar('train/total_loss_iter', loss.item(), i + num_img_tr * epoch)
+            self.summary_writer.add_scalar('train/total_losses vs. iters', loss.item(), i + iters_per_epoch * epoch)
 
             # Show 10 * 3 inference results each epoch
-            if i % (num_img_tr // 10) == 0:
-                global_step = i + num_img_tr * epoch
-                self.summary.visualize_image(self.writer, self.args.dataset, image, target, output, global_step)
-
-        self.writer.add_scalar('train/total_loss_epoch', train_loss, epoch)
+            if iters_per_epoch <= 10 or (i + 1) % (iters_per_epoch // 10) == 0:
+                global_step = i + iters_per_epoch * epoch
+                self.summary_writer.add_images('train/original_images', image[:4] * 0.5 + 0.5, global_step) 
+                self.summary_writer.add_images('train/groud_truth',
+                        decode_seg_map_sequence(target.detach().cpu().numpy()[:4], dataset='suichang_round1'), global_step, dataformats='NCHW')
+                self.summary_writer.add_images('train/predicted', 
+                        decode_seg_map_sequence(torch.argmax(output, dim=1).detach().cpu().numpy()[:4], dataset='suichang_round1'), global_step, dataformats='NCHW')
+        self.summary_writer.add_scalar('train/total_losses vs. epochs', train_loss, epoch)
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
         print('Loss: %.3f' % train_loss)
 
-        if self.args.no_val:
-            # save checkpoint every epoch
-            is_best = False
-            self.saver.save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': self.model.module.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'best_pred': self.best_pred,
-            }, is_best)
-
+        self.saver.save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': self.model.module.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+        }, filename='last.pth')
 
     def validation(self, epoch):
         self.model.eval()
@@ -154,11 +154,11 @@ class Trainer(object):
         Acc_class = self.evaluator.Pixel_Accuracy_Class()
         mIoU = self.evaluator.Mean_Intersection_over_Union()
         FWIoU = self.evaluator.Frequency_Weighted_Intersection_over_Union()
-        self.writer.add_scalar('val/total_loss_epoch', test_loss, epoch)
-        self.writer.add_scalar('val/mIoU', mIoU, epoch)
-        self.writer.add_scalar('val/Acc', Acc, epoch)
-        self.writer.add_scalar('val/Acc_class', Acc_class, epoch)
-        self.writer.add_scalar('val/fwIoU', FWIoU, epoch)
+        self.summary_writer.add_scalar('val/total_loss_epoch', test_loss, epoch)
+        self.summary_writer.add_scalar('val/mIoU', mIoU, epoch)
+        self.summary_writer.add_scalar('val/Acc', Acc, epoch)
+        self.summary_writer.add_scalar('val/Acc_class', Acc_class, epoch)
+        self.summary_writer.add_scalar('val/fwIoU', FWIoU, epoch)
         print('Validation:')
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
         print("Acc:{}, Acc_class:{}, mIoU:{}, fwIoU: {}".format(Acc, Acc_class, mIoU, FWIoU))
@@ -166,29 +166,60 @@ class Trainer(object):
 
         new_pred = mIoU
         if new_pred > self.best_pred:
-            is_best = True
-            self.best_pred = new_pred
             self.saver.save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': self.model.module.state_dict(),
                 'optimizer': self.optimizer.state_dict(),
-                'best_pred': self.best_pred,
-            }, is_best)
+            }, is_best=True, miou=new_pred)
+            self.best_pred = new_pred
+
+    def make_predict(self, args):
+        self.model.eval()
+        if args.do_eval:
+            ckpt_path = os.path.join(self.saver.expr_dir, 'best.pth')
+        else:
+            ckpt_path = os.path.join(self.saver.expr_dir, 'last.pth')
+        checkpoint = torch.load(ckpt_path)
+        self.model.module.load_state_dict(checkpoint['state_dict'])
+        results_dir = os.path.join(self.saver.expr_dir, 'results')
+        if not os.path.exists(results_dir):
+            os.mkdir(results_dir)
+
+        transform = transforms.Compose([
+            transforms.ToTensor(), 
+            transforms.Normalize((0.190, 0.235, 0.222, 0.527), (0.127, 0.122, 0.119, 0.199))
+        ])
+        test_image_names = os.listdir(args.test_dir)
+        for i, test_image_name in enumerate(tqdm(test_image_names)):
+            test_image = Image.open(os.path.join(args.test_dir, test_image_name))
+            self.summary_writer.add_image('test/ground_truth', torch.tensor(np.asarray(test_image)), global_step=i, dataformats='HWC') 
+            test_image = transform(test_image)
+            
+            test_image = torch.unsqueeze(test_image, 0)
+            if args.cuda:
+                test_image = test_image.cuda()
+            output = self.model(test_image)
+            output = torch.argmax(output, dim=1).squeeze() + 1
+            output = output.data.cpu().numpy().astype(np.uint8)
+            self.summary_writer.add_image('test/predicted', decode_segmap(output, dataset='tiny_suichang_round1'), global_step=i, dataformats='HWC')
+            Image.fromarray(output).save(os.path.join(results_dir, test_image_name.replace('.tif', '.png')))
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch DeeplabV3Plus Training")
-    parser.add_argument('--backbone', type=str, default='resnet',
+    parser.add_argument('--backbone', type=str, default='xception',
                         choices=['resnet', 'xception', 'drn', 'mobilenet'],
                         help='backbone name (default: resnet)')
+    parser.add_argument('--in-channels', type=int, default=3,
+                        help='input image channels, jpeg=3, tif=4')
     parser.add_argument('--out-stride', type=int, default=16,
                         help='network output stride (default: 8)')
     parser.add_argument('--dataset', type=str, default='pascal',
-                        choices=['pascal', 'coco', 'cityscapes'],
+                        choices=['pascal', 'coco', 'cityscapes', 'suichang_round1', 'tiny_suichang_round1'],
                         help='dataset name (default: pascal)')
     parser.add_argument('--use-sbd', action='store_true', default=False,
-                        help='whether to use SBD dataset (default: True)')
-    parser.add_argument('--workers', type=int, default=4,
-                        metavar='N', help='dataloader threads')
+                        help='whether to use SBD dataset (default: False)')
+    parser.add_argument('--workers', type=int, default=0,
+                        metavar='N', help='dataloader threads, if workers > 0, some unknown errors will occur!!!')
     parser.add_argument('--base-size', type=int, default=513,
                         help='base image size')
     parser.add_argument('--crop-size', type=int, default=513,
@@ -226,8 +257,8 @@ def main():
     parser.add_argument('--nesterov', action='store_true', default=False,
                         help='whether use nesterov (default: False)')
     # cuda, seed and logging
-    parser.add_argument('--no-cuda', action='store_true', default=
-                        False, help='disables CUDA training')
+    parser.add_argument('--use-cuda', action='store_true', default=
+                        True, help='whether using CUDA training')
     parser.add_argument('--gpu-ids', type=str, default='0',
                         help='use which gpu to train, must be a \
                         comma-separated list of integers only (default=0)')
@@ -241,15 +272,22 @@ def main():
     # finetuning pre-trained models
     parser.add_argument('--ft', action='store_true', default=False,
                         help='finetuning on a different dataset')
-    # evaluation option
-    parser.add_argument('--eval-interval', type=int, default=1,
-                        help='evaluuation interval (default: 1)')
-    parser.add_argument('--no-val', action='store_true', default=False,
-                        help='skip validation during training')
-
+    
+    # About validation  
+    parser.add_argument('--do-eval', action='store_true', default=False,
+                        help='whether evaluate model during training')
+    parser.add_argument('--eval-interval', type=int, default=5,
+                        help='evaluation interval (default: 1)')
+    parser.add_argument('--test-dir', type=str, default=None,
+                        help='test images directory')
+    
     args = parser.parse_args()
-    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    print(args)
+
+    # Determine whether using cuda.
+    args.cuda = torch.cuda.is_available() and args.use_cuda
     if args.cuda:
+        print('Use CUDA support!')
         try:
             args.gpu_ids = [int(s) for s in args.gpu_ids.split(',')]
         except ValueError:
@@ -284,20 +322,19 @@ def main():
         }
         args.lr = lrs[args.dataset.lower()] / (4 * len(args.gpu_ids)) * args.batch_size
 
-
-    if args.checkname is None:
-        args.checkname = 'deeplab-'+str(args.backbone)
-    print(args)
     torch.manual_seed(args.seed)
     trainer = Trainer(args)
     print('Starting Epoch:', trainer.args.start_epoch)
     print('Total Epoches:', trainer.args.epochs)
     for epoch in range(trainer.args.start_epoch, trainer.args.epochs):
         trainer.training(epoch)
-        if not trainer.args.no_val and epoch % args.eval_interval == (args.eval_interval - 1):
+        if trainer.args.do_eval and ((epoch + 1) % args.eval_interval == 0 or epoch + 1 == args.epochs):
             trainer.validation(epoch)
 
-    trainer.writer.close()
+    if args.test_dir:
+        trainer.make_predict(args)
+
+    trainer.summary_writer.close()
 
 if __name__ == "__main__":
    main()

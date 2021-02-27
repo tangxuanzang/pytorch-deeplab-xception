@@ -3,6 +3,10 @@ import numpy as np
 import torch
 
 def decode_seg_map_sequence(label_masks, dataset='pascal'):
+    """
+    decode a sequence of label mask
+    return decoded image, shape: (N, C, H, W)
+    """
     rgb_masks = []
     for label_mask in label_masks:
         rgb_mask = decode_segmap(label_mask, dataset)
@@ -14,12 +18,12 @@ def decode_seg_map_sequence(label_masks, dataset='pascal'):
 def decode_segmap(label_mask, dataset, plot=False):
     """Decode segmentation class labels into a color image
     Args:
-        label_mask (np.ndarray): an (M,N) array of integer values denoting
+        label_mask (np.ndarray): an (H,W) array of integer values denoting
           the class label at each spatial location.
         plot (bool, optional): whether to show the resulting color image
           in a figure.
     Returns:
-        (np.ndarray, optional): the resulting decoded color image.
+        (np.ndarray, optional): the resulting decoded color image, shape: (H, W, C).
     """
     if dataset == 'pascal' or dataset == 'coco':
         n_classes = 21
@@ -27,8 +31,13 @@ def decode_segmap(label_mask, dataset, plot=False):
     elif dataset == 'cityscapes':
         n_classes = 19
         label_colours = get_cityscapes_labels()
+    
+    elif dataset in ['suichang_round1', 'tiny_suichang_round1']:
+        n_classes = 10
+        label_colours = get_suichang_labels()
     else:
         raise NotImplementedError
+
 
     r = label_mask.copy()
     g = label_mask.copy()
@@ -99,3 +108,9 @@ def get_pascal_labels():
                        [64, 0, 128], [192, 0, 128], [64, 128, 128], [192, 128, 128],
                        [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
                        [0, 64, 128]])
+
+def get_suichang_labels():
+
+    return np.asarray([[0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+                       [0, 0, 128], [128, 0, 128], [0, 128, 128], [128, 128, 128],
+                       [64, 0, 0], [192, 0, 0]])

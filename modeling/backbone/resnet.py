@@ -44,7 +44,7 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, output_stride, BatchNorm, pretrained=True):
+    def __init__(self, block, layers, in_channels, output_stride, BatchNorm, pretrained=True):
         self.inplanes = 64
         super(ResNet, self).__init__()
         blocks = [1, 2, 4]
@@ -58,7 +58,7 @@ class ResNet(nn.Module):
             raise NotImplementedError
 
         # Modules
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3,
                                 bias=False)
         self.bn1 = BatchNorm(64)
         self.relu = nn.ReLU(inplace=True)
@@ -141,16 +141,18 @@ class ResNet(nn.Module):
         state_dict = self.state_dict()
         for k, v in pretrain_dict.items():
             if k in state_dict:
+                if k == 'conv1.weight':
+                    continue
                 model_dict[k] = v
         state_dict.update(model_dict)
         self.load_state_dict(state_dict)
 
-def ResNet101(output_stride, BatchNorm, pretrained=True):
+def ResNet101(in_channels, output_stride, BatchNorm, pretrained=True):
     """Constructs a ResNet-101 model.
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
     """
-    model = ResNet(Bottleneck, [3, 4, 23, 3], output_stride, BatchNorm, pretrained=pretrained)
+    model = ResNet(Bottleneck, [3, 4, 23, 3], in_channels, output_stride, BatchNorm, pretrained=pretrained)
     return model
 
 if __name__ == "__main__":
