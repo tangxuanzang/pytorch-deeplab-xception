@@ -1,4 +1,5 @@
 # pytorch-deeplab-xception
+**Update on 2021/2/27. Modify to adapt suichang data compete on :Tianchi
 
 **Update on 2018/12/06. Provide model trained on VOC and SBD datasets.**  
 
